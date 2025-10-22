@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 import calendar
 import numpy as np
 from matplotlib.image import imread
-
+from dotenv import load_dotenv
+import os
 
 
 # Configurações regionais e monetárias
@@ -1145,12 +1146,19 @@ class MasterReportGenerator:
         print(f"✨ Sucesso! O arquivo '{output_filename}' foi gerado com {len(figures_to_save)} páginas.")
 
 
+
+
 # --- Bloco de Execução Principal ---
 if __name__ == "__main__":
-    # URL e KEY do seu projeto Supabase (Substitua pelos seus dados reais)
+
+    
+    # SUPABASE_URL = os.getenv("SUPABASE_URL")
+    # SUPABASE_KEY = os.getenv("SUPABASE_KEY")
     SUPABASE_URL = "https://pnwkvrfshrthgtujmnkv.supabase.co"
     SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBud2t2cmZzaHJ0aGd0dWptbmt2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA1NDgyNDksImV4cCI6MjA3NjEyNDI0OX0.NyYFRbz81kJsXLXJJc9X92NVM_Zg-K29A2JuufnbWxA"
+
 
     # Criar e executar o gerador mestre
     master_generator = MasterReportGenerator(SUPABASE_URL, SUPABASE_KEY)
     master_generator.generate_all_reports()
+
