@@ -921,13 +921,55 @@ class HabitTracker:
         return fig
 
 
+import sys
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from datetime import datetime, timedelta
+import numpy as np
+from matplotlib.image import imread 
+import os 
+from supabase import create_client, Client 
+import pytz 
+
 class WorkoutReport:
-    """Gera gráficos e mapas visuais para rastreamento de treinos."""
+    """Gera gráficos e mapas visuais para rastreamento de treinos, focado em 4 períodos semanais."""
     
+    MUSCLE_MASKS_DIR = "body_images_masks/" 
+    
+    # Define o Fuso Horário Local (Ajuste se o servidor estiver em outro lugar ou você preferir outro fuso)
+    LOCAL_TIMEZONE = 'America/Sao_Paulo'
+    
+    MUSCLE_NAME_MAP = {
+        'Peitoral': 'peitoral', 'Deltóide': 'deltoides', 'Tríceps': 'triceps', 'Bíceps': 'biceps',
+        'Antebraço': 'antebraco', 'Glúteos': 'gluteo', 'Quadríceps': 'quadriceps', 
+        'Posterior de Coxa': 'posterior', 'Panturrilha': 'panturrilha', 'Lombar': 'lombar',
+        'Adutores': 'adutores', 'Abdutores': 'abdutores', 'Dorsal': 'dorsal', 'Romboides': 'romboides', 
+        'Core': 'core', 'Abdômen': 'core', 
+        'Costas': 'dorsal', 'Trapézio': 'romboides', 'Cardio': None 
+    }
+    
+    SERIES_LIMITS = {
+        'peitoral':    {'fraca': 7,  'media': 14}, 'dorsal':      {'fraca': 8,  'media': 15}, 
+        'romboides':   {'fraca': 8,  'media': 15}, 'quadriceps':  {'fraca': 8,  'media': 14},
+        'posterior':   {'fraca': 6,  'media': 11}, 'gluteo':      {'fraca': 7,  'media': 14},
+        'deltoides':   {'fraca': 7,  'media': 14}, 'biceps':      {'fraca': 5,  'media': 9},
+        'triceps':     {'fraca': 5,  'media': 9},  'panturrilha': {'fraca': 7,  'media': 14},
+        'core':        {'fraca': 7,  'media': 14}, 'adutores':    {'fraca': 5,  'media': 9}, 
+        'abdutores':   {'fraca': 5,  'media': 9},  'antebraco':   {'fraca': 5,  'media': 9},
+        'lombar':      {'fraca': 5,  'media': 9}, 
+    }
+    
+    COLOR_MAP = {
+        'fraca': '#2C7BB6', 'media': '#FFA500', 'alta': '#FF4500', 'cinza': '#30363d'    
+    }
+
     def __init__(self, supabase_url, supabase_key):
         # A chave e a URL são mantidas para compatibilidade futura com a busca de dados
         self.supabase_url = supabase_url
         self.supabase_key = supabase_key
+        
+        # **** CORREÇÃO CRÍTICA PARA O AttributeError: 'colors' ****
         self.colors = {
             'default': '#f0f6fc',
             'background': '#0d1117',
@@ -936,34 +978,207 @@ class WorkoutReport:
             'highlight': '#006d32', 
         }
         self.font_size = 9
-        # Caminho da imagem (A imagem 'body.jpg' deve estar no mesmo diretório)
+        # ************************************************************
+        
+        # Caminho da imagem 
         self.BODY_MAP_PATH = "body.png"
         
-        # Tenta carregar a imagem uma vez
+        try:
+            self.supabase: Client = create_client(supabase_url, supabase_key)
+        except Exception as e:
+            print(f"❌ ERRO ao inicializar cliente Supabase: {e}")
+            self.supabase = None 
+        
         try:
             self.body_map_img = imread(self.BODY_MAP_PATH)
-        except FileNotFoundError:
-            print(f"❌ ERRO: A imagem '{self.BODY_MAP_PATH}' não foi encontrada.")
+            self.base_map_img = imread(os.path.join(self.MUSCLE_MASKS_DIR, "fundo.png"))
+        except FileNotFoundError as e:
+            print(f"❌ ERRO: Imagem base não encontrada. {e}")
             self.body_map_img = None
+            self.base_map_img = None
+        
+        self.masks_cache = self._load_muscle_masks()
+        
+    def _load_muscle_masks(self):
+        """Carrega todas as máscaras pré-criadas em um cache."""
+        mask_map = {}
+        levels = {'f': 'fraca', 'm': 'media', 'a': 'alta'} 
+        
+        try:
+            mask_files = [f for f in os.listdir(self.MUSCLE_MASKS_DIR) if f.endswith('.png') and f != "fundo.png"]
+        except FileNotFoundError:
+            print(f"❌ ERRO: Pasta de máscaras '{self.MUSCLE_MASKS_DIR}' não encontrada.")
+            return {}
 
-    # --- FUNÇÕES DE PLOTAGEM ---
-    
-# DENTRO DA CLASSE WorkoutReport (APENAS ESTE MÉTODO É ALTERADO)
+        for filename in mask_files:
+            parts = filename.split('-')
+            if len(parts) == 2:
+                muscle_name = parts[0]
+                level_code = parts[1].split('.')[0] 
+                
+                if level_code in levels:
+                    level_name = levels[level_code]
+                    filepath = os.path.join(self.MUSCLE_MASKS_DIR, filename)
+                    
+                    try:
+                        mask_img = imread(filepath)
+                        if mask_img.ndim == 3 and mask_img.shape[2] == 4:
+                            if muscle_name not in mask_map:
+                                mask_map[muscle_name] = {}
+                            mask_map[muscle_name][level_name] = mask_img
+                    except Exception as e:
+                        print(f"❌ ERRO ao carregar {filename}: {e}")
+                        
+        return mask_map
 
-    def create_body_map_comparison(self, fig, gs_body_maps, comparison_titles):
+    def fetch_data_for_four_weeks(self):
         """
-        Gráfico 1: Plota 4 mapas corporais lado a lado para comparação.
-        Abordagem: Usa um Axes de fundo para o título e as 4 imagens em um GridSpec interno 1x4.
+        Busca dados para 4 janelas de 7 dias.
+        CORREÇÃO: Converte todas as datas para o fuso horário local para evitar o erro de 'Invalid comparison'.
+        """
+        if self.supabase is None:
+            return []
+
+        # 1. Determina a data atual no fuso horário local
+        try:
+            local_tz = pytz.timezone(self.LOCAL_TIMEZONE)
+        except pytz.UnknownTimeZoneError:
+            print(f"❌ ERRO: Fuso horário '{self.LOCAL_TIMEZONE}' é inválido. Usando UTC.")
+            local_tz = pytz.utc
+            
+        today_local = datetime.now(local_tz) 
+        
+        # Define as 4 janelas de 7 dias, usando objetos aware (com fuso horário)
+        windows = []
+        for i in range(4):
+            end_date = today_local - timedelta(days=7 * i)
+            start_date = end_date - timedelta(days=7)
+            windows.append({'start': start_date, 'end': end_date})
+            
+        windows.reverse() # Ordena: Semana 4, Semana 3, Semana 2, Semana 1 (mais recente)
+
+        # Usamos o ISO de UTC para a query 'gte' no Supabase
+        data_minima_iso = windows[0]['start'].astimezone(pytz.utc).isoformat()
+        
+        try:
+            # 1.1 e 1.2: Busca do Supabase
+            response_ex = self.supabase.table('exercicios').select('id, grupo_muscular_primario, grupos_musculares_secundarios').limit(500).execute()
+            df_exercicios = pd.DataFrame(response_ex.data).rename(columns={'id': 'exercicio_id'})
+            
+            response_rt = self.supabase.table('registros_treino').select('id, data_treino').gte('data_treino', data_minima_iso).execute()
+            df_rt = pd.DataFrame(response_rt.data).rename(columns={'id': 'registro_treino_id'})
+            
+            if df_rt.empty or df_exercicios.empty:
+                return []
+
+            treino_ids = df_rt['registro_treino_id'].tolist()
+            response_reg = self.supabase.table('registro_exercicios').select('registro_treino_id, exercicio_id').in_('registro_treino_id', treino_ids).execute()
+            df_registros = pd.DataFrame(response_reg.data)
+            
+            # 2. Processamento e conversão de fuso horário
+            df_full = df_registros.merge(df_rt, on='registro_treino_id')
+            df_full['data_treino'] = pd.to_datetime(df_full['data_treino'])
+            df_full = df_full.merge(df_exercicios, on='exercicio_id')
+            
+            # Converte a coluna de data (que deve estar em UTC vindo do Supabase) para o fuso horário local
+            # Esta é a correção final para o erro de comparação de datetime
+            df_full['data_treino'] = df_full['data_treino'].dt.tz_convert(local_tz)
+
+
+            weekly_data_sets = []
+            for window in windows:
+                # O filtro agora funciona corretamente
+                df_window = df_full[(df_full['data_treino'] >= window['start']) & (df_full['data_treino'] <= window['end'])]
+                
+                df_sets_in_period = df_window[['exercicio_id', 'grupo_muscular_primario', 'grupos_musculares_secundarios', 'registro_treino_id']].copy()
+                
+                weekly_data_sets.append({
+                    'start_date': window['start'].strftime('%d/%m'),
+                    'end_date': window['end'].strftime('%d/%m'),
+                    'data_sets': df_sets_in_period
+                })
+                
+            return weekly_data_sets
+
+        except Exception as e:
+            print(f"❌ ERRO ao buscar dados semanais do Supabase: {e}")
+            return []
+
+    def calculate_muscle_series_weekly(self, df_sets):
+        """Calcula o total de séries semanais por grupo muscular (1 série Primário, 0.5 série Secundário)."""
+        
+        if df_sets.empty:
+            return {}
+
+        df_sets['series_set'] = 1
+        series_por_exercicio = df_sets.groupby('exercicio_id')['series_set'].sum()
+        muscle_series_total = {}
+        
+        df_exercicios_unique = df_sets.drop_duplicates(subset=['exercicio_id'])
+        
+        for exercicio_id, total_series in series_por_exercicio.items():
+            
+            ex_row = df_exercicios_unique[df_exercicios_unique['exercicio_id'] == exercicio_id].iloc[0]
+
+            primary_muscle_db = ex_row['grupo_muscular_primario']
+            primary_muscle_key = self.MUSCLE_NAME_MAP.get(primary_muscle_db)
+            
+            if primary_muscle_key:
+                muscle_series_total[primary_muscle_key] = muscle_series_total.get(primary_muscle_key, 0) + total_series
+            
+            secondary_muscles_db = ex_row['grupos_musculares_secundarios']
+            if isinstance(secondary_muscles_db, list) and secondary_muscles_db:
+                secondary_series = total_series * 0.5
+                for secondary_db in secondary_muscles_db:
+                    secondary_key = self.MUSCLE_NAME_MAP.get(secondary_db)
+                    
+                    if secondary_key:
+                        muscle_series_total[secondary_key] = muscle_series_total.get(secondary_key, 0) + secondary_series
+        
+        return muscle_series_total
+
+    def generate_heatmap_overlay(self, muscle_series_total):
+        """
+        Gera a sobreposição de calor usando os limites de séries (fraca, media, alta).
+        """
+        if self.body_map_img is None or not self.masks_cache:
+             return None
+
+        overlay_img = np.zeros((*self.body_map_img.shape[:2], 4)) 
+        
+        for muscle_name_key, total_series in muscle_series_total.items():
+            
+            if total_series == 0 or muscle_name_key not in self.SERIES_LIMITS: continue
+            
+            limits = self.SERIES_LIMITS[muscle_name_key]
+            
+            level_name = None 
+            
+            if total_series > limits['media']:
+                level_name = 'alta' 
+            elif total_series > limits['fraca']:
+                level_name = 'media' 
+            elif total_series > 0:
+                 level_name = 'fraca' 
+
+            if level_name:
+                mask = self.masks_cache.get(muscle_name_key, {}).get(level_name)
+                
+                if mask is not None:
+                    overlay_img = np.maximum(overlay_img, mask)
+
+        return overlay_img
+
+    def create_body_map_comparison(self, fig, gs_body_maps, weekly_data_sets):
+        """
+        Gráfico 1: Plota 4 mapas corporais lado a lado, cada um representando o estímulo de uma semana.
         """
         
-        # O gs_body_maps é o slot do GridSpec maior. Vamos adicionar um Axes que preenche TODO esse slot.
         ax_container = fig.add_subplot(gs_body_maps, facecolor=self.colors['secondary_bg'])
         
-        # Título principal da seção
-        ax_container.set_title("1. Comparativo de Músculos Ativos por Sessão (Últimos 4 Treinos)", 
+        ax_container.set_title("1. Comparativo de Estímulo Semanal de Grupos Musculares (Últimas 4 Semanas)", 
                                  fontsize=12, fontweight='bold', color=self.colors['default'], pad=10)
         
-        # Desliga as bordas do Axes container
         ax_container.set_xticks([]); ax_container.set_yticks([]); ax_container.axis('off')
 
         if self.body_map_img is None:
@@ -971,64 +1186,37 @@ class WorkoutReport:
                             ha='center', va='center', color=self.colors['default'], transform=ax_container.transAxes)
             return
 
-        # Cria um GridSpec interno 1x4 (para as imagens) que fica DENTRO do Axes container
-        # Vamos usar SubplotSpec para garantir que ele se encaixe
         gs_inner = gridspec.GridSpecFromSubplotSpec(1, 4, subplot_spec=gs_body_maps, 
-                                                    wspace=0.1, hspace=0.1) # Ajuste de espaço (0.1 ou 0.05)
-
-        # 1. Plotar as 4 imagens lado a lado
-        for i, title in enumerate(comparison_titles):
-            # Adicionar cada imagem a um Axes dentro do GridSpec interno
+                                                    wspace=0.1, hspace=0.1)
+        
+        comparison_titles = ["Semana 4", "Semana 3", "Semana 2", "Semana 1 (Atual)"]
+        
+        for i in range(4):
             ax_sub = fig.add_subplot(gs_inner[0, i]) 
-            
-            # Remove o fundo para que o background do Axes container seja visível (não o fundo cinza de ax.imshow)
             ax_sub.set_facecolor(self.colors['secondary_bg'])
 
-            # Exibe a imagem, forçando a proporção correta ('equal')
-            ax_sub.imshow(self.body_map_img, aspect='equal')
+            title = comparison_titles[i]
+            overlay = None
             
-            # Adiciona o título
+            # weekly_data_sets está ordenado da Semana 4 (mais antiga) para a Semana 1 (mais recente)
+            if i < len(weekly_data_sets):
+                week_data = weekly_data_sets[i]
+                
+                title = f"{comparison_titles[i]}\n({week_data['start_date']} - {week_data['end_date']})"
+                
+                muscle_series = self.calculate_muscle_series_weekly(week_data['data_sets'])
+                overlay = self.generate_heatmap_overlay(muscle_series)
+
+            if self.base_map_img is not None:
+                 ax_sub.imshow(self.base_map_img, aspect='equal')
+            else:
+                 ax_sub.imshow(self.body_map_img, aspect='equal')
+
+            if overlay is not None:
+                 ax_sub.imshow(overlay, aspect='equal')
+            
             ax_sub.set_title(title, fontsize=8, color=self.colors['default'], pad=5)
-            
-            # Remove eixos e bordas
             ax_sub.axis('off')
-
-# DENTRO DA CLASSE WorkoutReport (APENAS ESTE MÉTODO É ALTERADO)
-
-    def generate_figure(self):
-        """Gera a figura completa do relatório de treino (Página 3)."""
-        plt.style.use('dark_background')
-        
-        FIG_WIDTH, FIG_HEIGHT = 8.5, 11.0 
-        fig_page3 = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT), facecolor=self.colors['background'])
-        
-        # Grid: [1.6: Mapas, 1.0: Gráfico 2, 1.0: Gráfico 3]
-        # Mantive 1.6, que deve ser alto o suficiente para a seção 1.
-        gs_page3 = gridspec.GridSpec(3, 1, figure=fig_page3, hspace=0.45, wspace=0.2, 
-                                     height_ratios=[1.6, 1.0, 1.0]) 
-
-        fig_page3.suptitle("RELATÓRIO DE TREINO - PROGRESSÃO", 
-                          fontsize=16, fontweight='bold', color=self.colors['default'], y=0.98)
-        
-        # 2. Gráfico 1: Comparativo de Mapas Corporais
-        comparison_titles = ["Última Sessão", "Penúltima", "Antepenúltima", "Pré-antepenúltima"]
-        
-        # Passamos o SubplotSpec para a função
-        self.create_body_map_comparison(fig_page3, gs_page3[0], comparison_titles)
-        
-        # 3. Gráfico 2: Placeholder
-        ax_placeholder_2 = fig_page3.add_subplot(gs_page3[1], facecolor=self.colors['secondary_bg'])
-        self.create_placeholder_chart_2(fig_page3, ax_placeholder_2)
-        
-        # 4. Gráfico 3: Placeholder
-        ax_placeholder_3 = fig_page3.add_subplot(gs_page3[2], facecolor=self.colors['secondary_bg'])
-        self.create_placeholder_chart_3(fig_page3, ax_placeholder_3)
-        
-        # Rodapé
-        plt.figtext(0.98, 0.01, f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ha='right', fontsize=8, color=self.colors['default'])
-        fig_page3.tight_layout(rect=[0, 0.03, 1, 0.96])
-
-        return fig_page3
 
     def create_placeholder_chart_2(self, fig, ax):
         """Gráfico 2: Placeholder para futuros dados (Ex: Volume de Treino por Mês)."""
@@ -1050,9 +1238,6 @@ class WorkoutReport:
         for spine in ax.spines.values(): spine.set_visible(False)
         ax.set_facecolor(self.colors['secondary_bg'])
 
-
-# DENTRO DA CLASSE WorkoutReport (APENAS ESTE MÉTODO É ALTERADO)
-
     def generate_figure(self):
         """Gera a figura completa do relatório de treino (Página 3)."""
         plt.style.use('dark_background')
@@ -1060,37 +1245,28 @@ class WorkoutReport:
         FIG_WIDTH, FIG_HEIGHT = 8.5, 11.0 
         fig_page3 = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT), facecolor=self.colors['background'])
         
-        # Grid: [1.6: Mapas, 1.0: Gráfico 2, 1.0: Gráfico 3]
+        weekly_data_sets = self.fetch_data_for_four_weeks()
+        
         gs_page3 = gridspec.GridSpec(3, 1, figure=fig_page3, 
                                      hspace=0.45, wspace=0.2, 
                                      height_ratios=[1.6, 1.0, 1.0],
-                                     # **** ALTERAÇÃO CRÍTICA AQUI ****
-                                     # Ajustando as margens para que os subplots usem a largura máxima
-                                     left=0.05,  # Margem esquerda (5% do total)
-                                     right=0.95  # Margem direita (95% do total)
-                                     # ********************************
+                                     left=0.05, 
+                                     right=0.95 
                                      ) 
 
         fig_page3.suptitle("RELATÓRIO DE TREINO - PROGRESSÃO", 
                           fontsize=16, fontweight='bold', color=self.colors['default'], y=0.98)
         
-        # 2. Gráfico 1: Comparativo de Mapas Corporais
-        comparison_titles = ["Última Sessão", "Penúltima", "Antepenúltima", "Pré-antepenúltima"]
+        self.create_body_map_comparison(fig_page3, gs_page3[0], weekly_data_sets)
         
-        # Passamos o SubplotSpec para a função
-        self.create_body_map_comparison(fig_page3, gs_page3[0], comparison_titles)
-        
-        # 3. Gráfico 2: Placeholder
         ax_placeholder_2 = fig_page3.add_subplot(gs_page3[1], facecolor=self.colors['secondary_bg'])
         self.create_placeholder_chart_2(fig_page3, ax_placeholder_2)
         
-        # 4. Gráfico 3: Placeholder
         ax_placeholder_3 = fig_page3.add_subplot(gs_page3[2], facecolor=self.colors['secondary_bg'])
         self.create_placeholder_chart_3(fig_page3, ax_placeholder_3)
         
-        # Rodapé
         plt.figtext(0.98, 0.01, f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ha='right', fontsize=8, color=self.colors['default'])
-        # Removi o tight_layout(rect) pois as margens agora estão no gridspec, garantindo o alinhamento central
+        
         plt.tight_layout(rect=[0, 0.03, 1, 0.96])
 
         return fig_page3
