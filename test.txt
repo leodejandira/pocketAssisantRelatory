@@ -1,0 +1,2 @@
+SUPABASE_URL = "https://pnwkvrfshrthgtujmnkv.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBud2t2cmZzaHJ0aGd0dWptbmt2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA1NDgyNDksImV4cCI6MjA3NjEyNDI0OX0.NyYFRbz81kJsXLXJJc9X92NVM_Zg-K29A2JuufnbWxA"
