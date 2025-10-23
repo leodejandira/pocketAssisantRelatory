@@ -947,6 +947,19 @@ from PIL import Image
 from imageio.v3 import imread 
 
 
+import os
+import io
+import pytz
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from datetime import datetime, timedelta
+from supabase import create_client, Client 
+from PIL import Image 
+from imageio.v3 import imread 
+
+
 class WorkoutReport:
     """Gera gráficos e mapas visuais para rastreamento de treinos, focado em 4 períodos semanais."""
     
@@ -989,7 +1002,7 @@ class WorkoutReport:
     ]
     RANK_ORDER = ['F', 'E', 'E+', 'D', 'D+', 'C', 'C+', 'B', 'B+', 'A', 'A+', 'S', 'S+']
 
-    # NOVO: Mapeamento de cores para o ranking
+    # Mapeamento de cores para o ranking
     RANK_COLORS = {
         'F':  '#0A1A2F',  # Azul bem escuro, quase preto
         'E':  '#0E2C4F',  # Azul escuro
@@ -1005,6 +1018,17 @@ class WorkoutReport:
         'S':  '#66FFFF',  # Azul muito luminoso, quase neon total
         'S+': '#00FFFF',  # Azul neon puro (ciano)
     }
+    
+    # NOVAS CONSTANTES HRR
+    HRR_EXERCICIO_ID = 16 # ID do exercício "HRR" no banco
+    
+    # NOVO Mapeamento de Cores para HRR (Gradiente de Azul: Escuro -> Claro/Brilhante)
+    HRR_THRESHOLDS = {
+        'Excelente': {'min': 45, 'cor': '#C7E9EF'}, # Ciano Claro (Mais Brilhante)
+        'Bom':       {'min': 30, 'max': 45, 'cor': '#9ACBE5'}, # Azul Ciano Médio
+        'Mediano':   {'min': 20, 'max': 30, 'cor': '#609ECF'}, # Azul Médio
+        'Ruim':      {'max': 20, 'cor': '#2C7BB6'} # Azul Escuro (Cor Radar/Volume)
+    }
 
 
     
@@ -1017,7 +1041,7 @@ class WorkoutReport:
             'background': '#0d1117',
             'secondary_bg': '#161b22',
             'border': '#30363d',
-            'highlight': '#006d32', # Cor antiga do Max Load (Verde)
+            'highlight': '#006d32', 
         }
         self.colors['radar_fill'] = self.COLOR_MAP['fraca'] # Azul escuro principal
         self.font_size = 9
@@ -1548,7 +1572,6 @@ class WorkoutReport:
     def _plot_force_rank_table_internal(self, ax, force_rank_data):
         """
         Plota a tabela de Max Load (Peso Máximo) e Ranks.
-        CORREÇÃO: Altera a cor do texto da coluna 'Max' para o azul do radar.
         """
         ax.axis('off')
         ax.set_facecolor(self.colors['secondary_bg'])
@@ -1593,7 +1616,7 @@ class WorkoutReport:
         for i in range(len(table_data)):
             table[(i+1, 0)].get_text().set_color(self.colors['default']) 
             
-            # ALTERADO PARA self.colors['radar_fill']
+            # Cor da coluna Max alterada para azul (radar_fill)
             table[(i+1, 1)].get_text().set_color(self.colors['radar_fill']) 
             
             table[(i+1, 1)].set_text_props(ha='right') 
@@ -1656,15 +1679,117 @@ class WorkoutReport:
         ax_table_force = fig.add_subplot(gs_inner[0, 2])
         self._plot_force_rank_table_internal(ax_table_force, force_rank_data) 
 
-    def create_placeholder_chart_3(self, fig, ax):
-        """Gráfico 3: Placeholder para futuros dados (Slot Livre)."""
-        ax.set_title("3. Slot em Branco (Para Próximos Gráficos)", 
+    # NOVO: Funções HRR
+    def _fetch_hrr_weekly_average(self, weekly_data_sets):
+        """
+        Calcula a média de HRR por semana a partir dos dados brutos.
+        O valor do HRR é armazenado em 'repeticoes' para o exercício ID 16.
+        """
+        hrr_data = []
+        
+        for i, week_data in enumerate(weekly_data_sets):
+            df_sets = week_data['data_sets']
+            
+            # Filtra apenas o exercício HRR (ID 16)
+            df_hrr = df_sets[df_sets['exercicio_id'] == self.HRR_EXERCICIO_ID].copy()
+            
+            # O valor do HRR é armazenado em 'repeticoes'
+            df_hrr['hrr_value'] = pd.to_numeric(
+                df_hrr['repeticoes'].astype(str).str.replace(',', '.'), 
+                errors='coerce'
+            ).fillna(0).astype(int)
+            
+            # Filtra registros com valor de HRR válido (maior que zero)
+            df_hrr = df_hrr[df_hrr['hrr_value'] > 0]
+            
+            # Calcula a média semanal
+            weekly_average = df_hrr['hrr_value'].mean() if not df_hrr.empty else 0
+            
+            hrr_data.append({
+                'label': f"S{i+1}\n({week_data['start_date']})",
+                'average_hrr': weekly_average
+            })
+            
+        return hrr_data
+        
+    def _plot_hrr_line_chart(self, fig, ax, hrr_data):
+        """
+        Gráfico 3: Plota o HRR médio semanal com zonas de referência.
+        Utilizando o gradiente de azul solicitado.
+        """
+        ax.set_title("3. Média Semanal de Recuperação da Frequência Cardíaca (HRR)", 
                      fontsize=12, fontweight='bold', color=self.colors['default'], pad=10)
-        ax.text(0.5, 0.5, "Espaço reservado para o próximo gráfico.", 
-                ha='center', va='center', color=self.colors['default'], transform=ax.transAxes)
-        ax.set_xticks([]); ax.set_yticks([])
-        for spine in ax.spines.values(): spine.set_visible(False)
         ax.set_facecolor(self.colors['secondary_bg'])
+        
+        labels = [d['label'] for d in hrr_data]
+        values = [d['average_hrr'] for d in hrr_data]
+        
+        # 1. Plotar as Zonas de Referência (HRR_THRESHOLDS)
+        current_y_min = 0 
+        max_y_data = max(values) * 1.1 if values and max(values) > 0 else 60
+        max_threshold = max([l.get('min', 0) for l in self.HRR_THRESHOLDS.values()] + [l.get('max', 0) for l in self.HRR_THRESHOLDS.values()])
+        ax.set_ylim(0, max(max_y_data, max_threshold * 1.1)) 
+
+        # Inverter a ordem para desenhar de baixo (Ruim/Escuro) para cima (Excelente/Claro)
+        sorted_thresholds = sorted(self.HRR_THRESHOLDS.items(), key=lambda item: item[1].get('min', 0))
+        
+        # Desenhar Zonas e Linhas
+        for level, limits in sorted_thresholds:
+            
+            y_max = limits.get('max', ax.get_ylim()[1]) 
+            y_min = limits.get('min', current_y_min)
+            
+            # Ajuste de limites para as zonas de extremidade (garantindo que cobrem a área correta)
+            if level == 'Excelente':
+                y_min = limits['min']
+                y_max = ax.get_ylim()[1]
+            elif level == 'Ruim':
+                y_max = limits['max']
+                y_min = 0
+
+            # Desenha o background da zona com a cor do gradiente de azul
+            zone_color = limits['cor']
+            ax.axhspan(y_min, y_max, facecolor=zone_color, alpha=0.15, zorder=0)
+
+            # Desenha a linha pontilhada (limite inferior da zona, exceto para 'Ruim')
+            if 'min' in limits and limits['min'] > 0:
+                 # Usa uma versão mais escura da cor para a linha de separação
+                 ax.axhline(limits['min'], color=zone_color, linestyle='--', linewidth=1.0, alpha=0.9, zorder=1)
+            
+            # Adiciona o rótulo da zona (ajustando a posição vertical)
+            # Usa a cor da zona para o texto
+            if len(labels) > 0:
+                text_y = y_max - (y_max - y_min) * 0.25 
+                if level == 'Ruim': text_y = y_max * 0.5
+                
+                ax.text(len(labels) - 0.5, text_y, f"{level}", 
+                        ha='right', va='center', fontsize=8, color=zone_color, fontweight='bold', alpha=0.9)
+                
+            current_y_min = y_max
+
+        # Configurar Eixos
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, color=self.colors['default'], fontsize=8)
+        ax.set_xlabel("Média Semanal", color=self.colors['default'], labelpad=10)
+        ax.set_ylabel("HRR (Batimentos/min)", color=self.colors['default'], labelpad=10)
+        
+        # 2. Plotar a Linha do HRR
+        if any(v > 0 for v in values):
+            
+            # Linha principal - usa o azul escuro padrão para manter a consistência com o radar
+            ax.plot(values, color=self.colors['radar_fill'], marker='o', linewidth=2, linestyle='-', markersize=6, zorder=3)
+            
+            # Adicionar rótulos de valor em cima dos pontos
+            for x, y in enumerate(values):
+                if y > 0:
+                    ax.text(x, y + 1, f"{y:.1f}", ha='center', va='bottom', fontsize=7, color=self.colors['default'], fontweight='bold', zorder=4)
+
+        ax.tick_params(axis='y', colors=self.colors['default'], labelsize=8)
+        ax.grid(axis='y', color=self.colors['border'], linestyle='-', alpha=0.5)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_color(self.colors['border'])
+        ax.spines['left'].set_color(self.colors['border'])
 
     def generate_figure(self):
         """Gera a figura completa do relatório de treino (Página 3)."""
@@ -1692,9 +1817,10 @@ class WorkoutReport:
         weekly_volume_data = self.calculate_volume_load_weekly(weekly_data_sets)
         self.create_volume_radar_charts(fig_page3, gs_page3[1], weekly_volume_data, weekly_data_sets)
         
-        # 3. Placeholder
-        ax_placeholder_3 = fig_page3.add_subplot(gs_page3[2], facecolor=self.colors['secondary_bg'])
-        self.create_placeholder_chart_3(fig_page3, ax_placeholder_3)
+        # 3. Gráfico de HRR 
+        hrr_data = self._fetch_hrr_weekly_average(weekly_data_sets)
+        ax_hrr = fig_page3.add_subplot(gs_page3[2], facecolor=self.colors['secondary_bg'])
+        self._plot_hrr_line_chart(fig_page3, ax_hrr, hrr_data)
         
         plt.figtext(0.98, 0.01, f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ha='right', fontsize=8, color=self.colors['default'])
         
