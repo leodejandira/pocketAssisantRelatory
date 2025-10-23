@@ -921,23 +921,37 @@ class HabitTracker:
         return fig
 
 
-import sys
+import os
+import io
+import pytz
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from datetime import datetime, timedelta
-import numpy as np
-from matplotlib.image import imread 
-import os 
 from supabase import create_client, Client 
-import pytz 
+from PIL import Image 
+from imageio.v3 import imread 
+
+
+import os
+import io
+import pytz
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from datetime import datetime, timedelta
+from supabase import create_client, Client 
+from PIL import Image 
+from imageio.v3 import imread 
+
 
 class WorkoutReport:
     """Gera gráficos e mapas visuais para rastreamento de treinos, focado em 4 períodos semanais."""
     
     MUSCLE_MASKS_DIR = "body_images_masks/" 
     
-    # Define o Fuso Horário Local (Ajuste se o servidor estiver em outro lugar ou você preferir outro fuso)
     LOCAL_TIMEZONE = 'America/Sao_Paulo'
     
     MUSCLE_NAME_MAP = {
@@ -961,26 +975,53 @@ class WorkoutReport:
     }
     
     COLOR_MAP = {
-        'fraca': '#2C7BB6', 'media': '#FFA500', 'alta': '#FF4500', 'cinza': '#30363d'    
+        'fraca': '#2C7BB6', 'media': '#FFA500', 'alta': '#FF4500', 'cinza': '#30363d'   
     }
 
+    # Constantes para Radar e Força
+    RADAR_CATEGORIES = ['Peito', 'Ombros', 'Core', 'Costas', 'Pernas', 'Braços']
+    NUM_CATEGORIES = len(RADAR_CATEGORIES)
+    ANGLES = np.linspace(0, 2 * np.pi, NUM_CATEGORIES, endpoint=False).tolist()
+    ANGLES += ANGLES[:1] 
+    
+    KEY_EXERCISES = [
+        'Supino reto', 'Agachamento livre', 'Remada curvada', 'Push Press', 'Levantamento terra', 'Barra fixa'
+    ]
+    RANK_ORDER = ['F', 'E', 'E+', 'D', 'D+', 'C', 'C+', 'B', 'B+', 'A', 'A+', 'S', 'S+']
+
+    # NOVO: Mapeamento de cores para o ranking
+    RANK_COLORS = {
+        'F':  '#0A1A2F',  # Azul bem escuro, quase preto
+        'E':  '#0E2C4F',  # Azul escuro
+        'E+': '#12406F',  # Azul mais saturado
+        'D':  '#175C9E',  # Azul médio-escuro
+        'D+': '#1E6FC4',  # Azul mais vivo
+        'C':  '#2582EA',  # Azul forte
+        'C+': '#2C9CFF',  # Azul brilhante
+        'B':  '#33B5FF',  # Azul mais intenso
+        'B+': '#3CCAFF',  # Azul neon claro
+        'A':  '#45DDFF',  # Azul neon
+        'A+': '#4FF0FF',  # Azul ciano elétrico
+        'S':  '#66FFFF',  # Azul muito luminoso, quase neon total
+        'S+': '#00FFFF',  # Azul neon puro (ciano)
+    }
+
+
+    
     def __init__(self, supabase_url, supabase_key):
-        # A chave e a URL são mantidas para compatibilidade futura com a busca de dados
         self.supabase_url = supabase_url
         self.supabase_key = supabase_key
         
-        # **** CORREÇÃO CRÍTICA PARA O AttributeError: 'colors' ****
         self.colors = {
             'default': '#f0f6fc',
             'background': '#0d1117',
             'secondary_bg': '#161b22',
             'border': '#30363d',
-            'highlight': '#006d32', 
+            'highlight': '#006d32', # Cor antiga do Max Load (Verde)
         }
+        self.colors['radar_fill'] = self.COLOR_MAP['fraca'] # Azul escuro principal
         self.font_size = 9
-        # ************************************************************
         
-        # Caminho da imagem 
         self.BODY_MAP_PATH = "body.png"
         
         try:
@@ -988,6 +1029,9 @@ class WorkoutReport:
         except Exception as e:
             print(f"❌ ERRO ao inicializar cliente Supabase: {e}")
             self.supabase = None 
+        
+        self.user_body_weight = self._fetch_user_body_weight()
+        self.force_ranks_map = self._fetch_force_ranks_map()
         
         try:
             self.body_map_img = imread(self.BODY_MAP_PATH)
@@ -1033,13 +1077,12 @@ class WorkoutReport:
 
     def fetch_data_for_four_weeks(self):
         """
-        Busca dados para 4 janelas de 7 dias.
-        CORREÇÃO: Converte todas as datas para o fuso horário local para evitar o erro de 'Invalid comparison'.
+        Busca dados para 4 janelas de 7 dias, incluindo 'peso', 'repeticoes', 'tempo' e 'nome'
+        para os cálculos de Volume e Força.
         """
         if self.supabase is None:
             return []
 
-        # 1. Determina a data atual no fuso horário local
         try:
             local_tz = pytz.timezone(self.LOCAL_TIMEZONE)
         except pytz.UnknownTimeZoneError:
@@ -1048,21 +1091,18 @@ class WorkoutReport:
             
         today_local = datetime.now(local_tz) 
         
-        # Define as 4 janelas de 7 dias, usando objetos aware (com fuso horário)
         windows = []
         for i in range(4):
             end_date = today_local - timedelta(days=7 * i)
             start_date = end_date - timedelta(days=7)
             windows.append({'start': start_date, 'end': end_date})
             
-        windows.reverse() # Ordena: Semana 4, Semana 3, Semana 2, Semana 1 (mais recente)
+        windows.reverse() 
 
-        # Usamos o ISO de UTC para a query 'gte' no Supabase
         data_minima_iso = windows[0]['start'].astimezone(pytz.utc).isoformat()
         
         try:
-            # 1.1 e 1.2: Busca do Supabase
-            response_ex = self.supabase.table('exercicios').select('id, grupo_muscular_primario, grupos_musculares_secundarios').limit(500).execute()
+            response_ex = self.supabase.table('exercicios').select('id, nome, grupo_muscular_primario, grupos_musculares_secundarios').limit(500).execute()
             df_exercicios = pd.DataFrame(response_ex.data).rename(columns={'id': 'exercicio_id'})
             
             response_rt = self.supabase.table('registros_treino').select('id, data_treino').gte('data_treino', data_minima_iso).execute()
@@ -1072,25 +1112,20 @@ class WorkoutReport:
                 return []
 
             treino_ids = df_rt['registro_treino_id'].tolist()
-            response_reg = self.supabase.table('registro_exercicios').select('registro_treino_id, exercicio_id').in_('registro_treino_id', treino_ids).execute()
+            response_reg = self.supabase.table('registro_exercicios').select('registro_treino_id, exercicio_id, peso, repeticoes, tempo').in_('registro_treino_id', treino_ids).execute()
             df_registros = pd.DataFrame(response_reg.data)
             
-            # 2. Processamento e conversão de fuso horário
             df_full = df_registros.merge(df_rt, on='registro_treino_id')
             df_full['data_treino'] = pd.to_datetime(df_full['data_treino'])
             df_full = df_full.merge(df_exercicios, on='exercicio_id')
             
-            # Converte a coluna de data (que deve estar em UTC vindo do Supabase) para o fuso horário local
-            # Esta é a correção final para o erro de comparação de datetime
             df_full['data_treino'] = df_full['data_treino'].dt.tz_convert(local_tz)
-
 
             weekly_data_sets = []
             for window in windows:
-                # O filtro agora funciona corretamente
-                df_window = df_full[(df_full['data_treino'] >= window['start']) & (df_full['data_treino'] <= window['end'])]
+                df_window = df_full[(df_full['data_treino'] >= window['start']) & (df_full['data_treino'] <= window['end'])].copy()
                 
-                df_sets_in_period = df_window[['exercicio_id', 'grupo_muscular_primario', 'grupos_musculares_secundarios', 'registro_treino_id']].copy()
+                df_sets_in_period = df_window.copy()
                 
                 weekly_data_sets.append({
                     'start_date': window['start'].strftime('%d/%m'),
@@ -1136,36 +1171,37 @@ class WorkoutReport:
                         muscle_series_total[secondary_key] = muscle_series_total.get(secondary_key, 0) + secondary_series
         
         return muscle_series_total
-
+    
     def generate_heatmap_overlay(self, muscle_series_total):
         """
-        Gera a sobreposição de calor usando os limites de séries (fraca, media, alta).
+        Gera a sobreposição de calor, preservando as cores originais das máscaras.
         """
         if self.body_map_img is None or not self.masks_cache:
-             return None
+            return None
 
-        overlay_img = np.zeros((*self.body_map_img.shape[:2], 4)) 
-        
+        overlay_img = np.zeros((*self.body_map_img.shape[:2], 4), dtype=np.uint8)
+
         for muscle_name_key, total_series in muscle_series_total.items():
             
-            if total_series == 0 or muscle_name_key not in self.SERIES_LIMITS: continue
+            if total_series == 0 or muscle_name_key not in self.SERIES_LIMITS:
+                continue
             
             limits = self.SERIES_LIMITS[muscle_name_key]
-            
-            level_name = None 
+            level_name = None
             
             if total_series > limits['media']:
-                level_name = 'alta' 
+                level_name = 'alta'
             elif total_series > limits['fraca']:
-                level_name = 'media' 
+                level_name = 'media'
             elif total_series > 0:
-                 level_name = 'fraca' 
+                level_name = 'fraca'
 
             if level_name:
                 mask = self.masks_cache.get(muscle_name_key, {}).get(level_name)
                 
                 if mask is not None:
-                    overlay_img = np.maximum(overlay_img, mask)
+                    mask_alpha_channel = mask[:, :, 3] > 0
+                    overlay_img[mask_alpha_channel] = mask[mask_alpha_channel]
 
         return overlay_img
 
@@ -1177,13 +1213,13 @@ class WorkoutReport:
         ax_container = fig.add_subplot(gs_body_maps, facecolor=self.colors['secondary_bg'])
         
         ax_container.set_title("1. Comparativo de Estímulo Semanal de Grupos Musculares (Últimas 4 Semanas)", 
-                                 fontsize=12, fontweight='bold', color=self.colors['default'], pad=10)
+                                   fontsize=12, fontweight='bold', color=self.colors['default'], pad=10)
         
         ax_container.set_xticks([]); ax_container.set_yticks([]); ax_container.axis('off')
 
         if self.body_map_img is None:
             ax_container.text(0.5, 0.5, "Imagem 'body.jpg' não encontrada. Verifique o caminho.", 
-                            ha='center', va='center', color=self.colors['default'], transform=ax_container.transAxes)
+                              ha='center', va='center', color=self.colors['default'], transform=ax_container.transAxes)
             return
 
         gs_inner = gridspec.GridSpecFromSubplotSpec(1, 4, subplot_spec=gs_body_maps, 
@@ -1198,7 +1234,6 @@ class WorkoutReport:
             title = comparison_titles[i]
             overlay = None
             
-            # weekly_data_sets está ordenado da Semana 4 (mais antiga) para a Semana 1 (mais recente)
             if i < len(weekly_data_sets):
                 week_data = weekly_data_sets[i]
                 
@@ -1208,31 +1243,424 @@ class WorkoutReport:
                 overlay = self.generate_heatmap_overlay(muscle_series)
 
             if self.base_map_img is not None:
-                 ax_sub.imshow(self.base_map_img, aspect='equal')
+                ax_sub.imshow(self.base_map_img, aspect='equal')
             else:
-                 ax_sub.imshow(self.body_map_img, aspect='equal')
+                ax_sub.imshow(self.body_map_img, aspect='equal')
 
             if overlay is not None:
-                 ax_sub.imshow(overlay, aspect='equal')
+                ax_sub.imshow(overlay, aspect='equal')
             
             ax_sub.set_title(title, fontsize=8, color=self.colors['default'], pad=5)
             ax_sub.axis('off')
 
-    def create_placeholder_chart_2(self, fig, ax):
-        """Gráfico 2: Placeholder para futuros dados (Ex: Volume de Treino por Mês)."""
-        ax.set_title("2. Volume de Treino e Frequência Mensal (Em Construção)", 
-                     fontsize=12, fontweight='bold', color=self.colors['default'], pad=10)
-        ax.text(0.5, 0.5, "Dados de volume e frequência em desenvolvimento.", 
-                ha='center', va='center', color=self.colors['default'], transform=ax.transAxes)
-        ax.set_xticks([]); ax.set_yticks([])
-        for spine in ax.spines.values(): spine.set_visible(False)
+    # Funções de Volume e Força (Gráfico 2)
+    def _fetch_user_body_weight(self):
+        """Busca o último peso corporal registrado do usuário."""
+        if self.supabase is None: return 75.0 
+        
+        try:
+            response = self.supabase.table('peso_corporal').select('peso_kg').order('data_registro', desc=True).limit(1).execute()
+            
+            if response.data and response.data[0]['peso_kg'] is not None:
+                return float(response.data[0]['peso_kg'])
+            
+            return 75.0
+            
+        except Exception as e:
+            print(f"❌ ERRO ao buscar peso corporal: {e}. Usando 75.0 kg.")
+            return 75.0
+
+    def _fetch_force_ranks_map(self):
+        """Busca a matriz de ranks de força do banco de dados e monta o dicionário."""
+        if self.supabase is None: return {}
+        
+        try:
+            response = self.supabase.table('configuracao_rank_forca').select('nome_exercicio, rank_nome, multiplo_pc').execute()
+            
+            rank_map = {}
+            for row in response.data:
+                ex_name = row['nome_exercicio']
+                rank_name = row['rank_nome']
+                multiplo = float(row['multiplo_pc'])
+                
+                if ex_name not in rank_map:
+                    rank_map[ex_name] = {}
+                
+                rank_map[ex_name][rank_name] = multiplo
+                
+            return rank_map
+            
+        except Exception as e:
+            print(f"❌ ERRO ao buscar configuração de ranks: {e}. Usando dados simulados.")
+            return {
+                'Supino reto': {'F': 0.0, 'E': 0.5, 'C': 1.0, 'A': 1.5},
+                'Agachamento livre': {'F': 0.0, 'E': 0.7, 'C': 1.3, 'A': 2.0},
+                'Levantamento terra': {'F': 0.0, 'E': 0.8, 'C': 1.6, 'A': 2.5},
+                'Remada curvada': {'F': 0.0, 'E': 0.4, 'C': 0.8, 'A': 1.2},
+                'Push Press': {'F': 0.0, 'E': 0.3, 'C': 0.6, 'A': 0.9},
+                'Barra fixa': {'F': 0.0, 'E': 3, 'C': 8, 'A': 15}, # Contagem de Reps
+            }
+            
+    def _get_rank_for_lift(self, exercise_name, max_rep_value):
+        """Calcula o Rank (F a S+) baseado no valor (Max Load ou Reps) e no PC."""
+        
+        target_multipliers = self.force_ranks_map.get(exercise_name, {})
+        current_rank = 'F'
+        
+        if not target_multipliers: return current_rank
+
+        if exercise_name == 'Barra fixa':
+            base_value = max_rep_value 
+            
+        else:
+            pc = self.user_body_weight
+            base_value = max_rep_value / pc if pc > 0 else 0 
+
+        # Itera sobre os ranks em ordem crescente para encontrar o maior rank atingido
+        for rank in self.RANK_ORDER:
+            multiplo_piso = target_multipliers.get(rank, None)
+            
+            if multiplo_piso is not None and base_value >= multiplo_piso:
+                current_rank = rank
+            # Se chegamos a um rank onde o valor está abaixo do piso, paramos.
+            # (Assumindo que os múltiplos_piso estão em ordem crescente)
+            elif multiplo_piso is not None and base_value < multiplo_piso:
+                break
+                
+        return current_rank
+
+    def calculate_max_load_and_rank(self, weekly_data_sets):
+        """
+        Calcula o maior Peso (Max Load) nos últimos 28 dias para os exercícios chave.
+        """
+        
+        all_series_data = pd.concat([w['data_sets'] for w in weekly_data_sets if not w['data_sets'].empty])
+        if all_series_data.empty: return []
+
+        df_key_lifts = all_series_data[all_series_data['nome'].isin(self.KEY_EXERCISES)].copy()
+        
+        if df_key_lifts.empty: return []
+
+        df_key_lifts['peso_num'] = pd.to_numeric(df_key_lifts['peso'].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0).astype(float)
+        df_key_lifts['repeticoes_num'] = pd.to_numeric(df_key_lifts['repeticoes'].astype(str).str.replace(',', '.'), errors='coerce').fillna(0).astype(int)
+
+        df_key_lifts_valid = df_key_lifts[
+            (df_key_lifts['peso_num'] > 0) & 
+            (df_key_lifts['repeticoes_num'] > 0)
+        ].copy()
+
+        max_results = []
+        
+        for ex_name_db in self.KEY_EXERCISES:
+            df_ex = df_key_lifts_valid[df_key_lifts_valid['nome'] == ex_name_db]
+            
+            if ex_name_db == 'Barra fixa':
+                 df_bar_fixa_sem_peso = df_key_lifts[
+                     (df_key_lifts['nome'] == 'Barra fixa') & 
+                     (df_key_lifts['peso_num'] <= 5.0) &
+                     (df_key_lifts['repeticoes_num'] > 0)
+                 ]
+                 if not df_bar_fixa_sem_peso.empty:
+                      max_reps = df_bar_fixa_sem_peso['repeticoes_num'].max()
+                      max_results.append({
+                           'nome': 'Barra fixa', 
+                           'max_value': float(max_reps), 
+                           'rank': self._get_rank_for_lift('Barra fixa', max_reps)
+                      })
+                      continue 
+
+            if not df_ex.empty:
+                 max_load = df_ex['peso_num'].max()
+                 
+                 if max_load > 0:
+                      max_results.append({
+                           'nome': ex_name_db, 
+                           'max_value': max_load, 
+                           'rank': self._get_rank_for_lift(ex_name_db, max_load) 
+                      })
+                 else:
+                      max_results.append({'nome': ex_name_db, 'max_value': 0.0, 'rank': 'F'})
+            else:
+                 max_results.append({'nome': ex_name_db, 'max_value': 0.0, 'rank': 'F'})
+
+        for res in max_results:
+            if res['nome'] == 'Levantamento terra': res['nome'] = 'Terra'
+            elif res['nome'] == 'Agachamento livre': res['nome'] = 'Agachamento'
+            elif res['nome'] == 'Remada curvada': res['nome'] = 'Remada curv.'
+            elif res['nome'] == 'Supino reto': res['nome'] = 'Supino'
+                
+        return max_results
+
+    def calculate_volume_load_weekly(self, weekly_data_sets):
+        """
+        Calcula o Volume-Carga semanal simples (Peso x Reps x Séries)
+        e o atribui 100% ao grupo muscular Primário.
+        """
+        all_series_data = pd.concat([w['data_sets'] for w in weekly_data_sets if not w['data_sets'].empty])
+        if all_series_data.empty: return {}
+        
+        df_sets = all_series_data.copy()
+
+        df_sets['peso_num'] = pd.to_numeric(df_sets['peso'].astype(str).str.replace(',', '.'), errors='coerce').fillna(0.0).astype(float)
+        df_sets['repeticoes_num'] = pd.to_numeric(df_sets['repeticoes'].astype(str).str.replace(',', '.'), errors='coerce').fillna(0).astype(int)
+        df_sets['tempo_num'] = pd.to_numeric(df_sets['tempo'].astype(str).str.replace(',', '.'), errors='coerce').fillna(0).astype(float) 
+
+        df_sets['volume_load'] = np.where(
+            df_sets['repeticoes_num'] > 0, 
+            df_sets['repeticoes_num'] * df_sets['peso_num'],
+            df_sets['tempo_num'] * df_sets['peso_num']
+        )
+        
+        volume_por_exercicio = df_sets.groupby('exercicio_id')['volume_load'].sum()
+
+        muscle_volume_total = {}
+        df_exercicios_unique = df_sets.drop_duplicates(subset=['exercicio_id'])
+            
+        for exercicio_id, total_volume in volume_por_exercicio.items():
+            if exercicio_id not in df_exercicios_unique['exercicio_id'].values: continue
+            
+            ex_row = df_exercicios_unique[df_exercicios_unique['exercicio_id'] == exercicio_id].iloc[0]
+            primary_muscle_db = ex_row['grupo_muscular_primario']
+            primary_muscle_key = self.MUSCLE_NAME_MAP.get(primary_muscle_db)
+            
+            if primary_muscle_key and primary_muscle_key != 'cardio':
+                muscle_volume_total[primary_muscle_key] = muscle_volume_total.get(primary_muscle_key, 0) + total_volume
+                
+        return muscle_volume_total
+    
+    def _create_radar_chart(self, title, max_volume, volume_data={}, color=None):
+        """Cria um gráfico de radar (hexagonal) preenchido com volume_data."""
+        if color is None: color = self.colors['radar_fill']
+        
+        values = []
+        radar_values_map = {}
+        
+        val_peito = volume_data.get('peitoral', 0)
+        values.append(val_peito)
+        radar_values_map['Peito'] = val_peito
+        
+        val_ombros = volume_data.get('deltoides', 0)
+        values.append(val_ombros)
+        radar_values_map['Ombros'] = val_ombros
+        
+        val_core = volume_data.get('core', 0) + volume_data.get('adutores', 0) + volume_data.get('abdutores', 0)
+        values.append(val_core) 
+        radar_values_map['Core'] = val_core
+        
+        val_costas = volume_data.get('dorsal', 0) + volume_data.get('romboides', 0) + volume_data.get('lombar', 0)
+        values.append(val_costas)
+        radar_values_map['Costas'] = val_costas
+        
+        val_pernas = volume_data.get('quadriceps', 0) + volume_data.get('posterior', 0) + volume_data.get('gluteo', 0) + volume_data.get('panturrilha', 0) 
+        values.append(val_pernas)
+        radar_values_map['Pernas'] = val_pernas
+        
+        val_bracos = volume_data.get('biceps', 0) + volume_data.get('triceps', 0) + volume_data.get('antebraco', 0) 
+        values.append(val_bracos) 
+        radar_values_map['Braços'] = val_bracos
+            
+        values += values[:1] 
+        
+        fig, ax = plt.subplots(figsize=(4, 4), subplot_kw=dict(polar=True), facecolor=self.colors['secondary_bg'])
+        
+        if sum(values) > 0:
+            ax.plot(self.ANGLES, values, color=color, linewidth=2, linestyle='solid') 
+            ax.fill(self.ANGLES, values, color=color, alpha=0.25) 
+        
+        ax.set_xticks(self.ANGLES[:-1])
+        ax.set_xticklabels(self.RADAR_CATEGORIES, color=self.colors['default'], size=9)
+        
+        r_ticks = np.linspace(0, max_volume, 6)
+        ax.set_yticks(r_ticks) 
+        
+        def format_volume(vol):
+            if vol >= 1000000: return f"{vol/1000000:.0f}M kg"
+            if vol >= 1000: return f"{vol/1000:.0f}k kg"
+            return f"{int(vol)} kg"
+
+        tick_labels = [""] * 5 + [format_volume(max_volume)]
+        ax.set_yticklabels(tick_labels, color="grey", size=8) 
+        
+        ax.set_ylim(0, max_volume) 
+        ax.set_rlabel_position(0)
+        ax.grid(color=self.colors['border'], alpha=0.5)
+        ax.spines['polar'].set_color(self.colors['border'])
+        ax.set_title(title, va='bottom', color=self.colors['default'], size=10, pad=5)
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1, transparent=True, dpi=300) 
+        plt.close(fig)
+        buf.seek(0)
+        
+        return Image.open(buf), radar_values_map
+        
+    def _plot_volume_summary_table(self, ax, radar_values_map):
+        """
+        Plota uma tabela de resumo de valores ao lado do radar.
+        """
+        ax.axis('off')
         ax.set_facecolor(self.colors['secondary_bg'])
+        
+        # Limpar o eixo X e Y completamente
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlabel(""); ax.set_ylabel("")
+        
+        ax.text(0.5, 0.95, "Volume (Últimas 28 dias)", 
+                ha='center', va='top', fontsize=10, fontweight='bold', color=self.colors['default'])
+        
+        table_data = []
+        for category in self.RADAR_CATEGORIES:
+            volume = radar_values_map.get(category, 0)
+            
+            if volume >= 1000000:
+                vol_str = f"{volume/1000000:.2f}M kg"
+            elif volume >= 1000:
+                vol_str = f"{volume/1000:.2f}k kg"
+            else:
+                vol_str = f"{volume:.0f} kg"
+                
+            table_data.append([category, vol_str])
+            
+        # Ambos os rótulos de coluna vazios para remover "Eixo"
+        table = ax.table(cellText=table_data, 
+                         colLabels=["", ""], 
+                         loc='center', 
+                         cellLoc='left',
+                         colColours=[self.colors['secondary_bg']]*2, 
+                         cellColours=[[self.colors['secondary_bg']]*2]*len(table_data)
+                         )
+                         
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.5) 
+
+        for i in range(len(table_data)):
+            table[(i+1, 0)].get_text().set_color(self.colors['default']) 
+            table[(i+1, 1)].get_text().set_color(self.colors['radar_fill']) 
+            table[(i+1, 1)].set_text_props(ha='right') 
+            
+        # Limpa o texto dos rótulos de cabeçalho
+        for j in range(2):
+            table[(0, j)].get_text().set_color(self.colors['default'])
+            table[(0, j)].get_text().set_text('') 
+        table[(0, 1)].set_text_props(ha='right')
+        
+    def _plot_force_rank_table_internal(self, ax, force_rank_data):
+        """
+        Plota a tabela de Max Load (Peso Máximo) e Ranks.
+        CORREÇÃO: Altera a cor do texto da coluna 'Max' para o azul do radar.
+        """
+        ax.axis('off')
+        ax.set_facecolor(self.colors['secondary_bg'])
+        
+        ax.text(0.5, 0.95, "Força Máxima (Max Load/Reps)", 
+                ha='center', va='top', fontsize=10, fontweight='bold', color=self.colors['default'])
+        
+        table_data = []
+        
+        ordered_data = {item['nome']: item for item in force_rank_data}
+        ordered_list = [ordered_data.get(name, {'nome': name, 'max_value': 0.0, 'rank': 'F'}) 
+                        for name in ['Supino', 'Agachamento', 'Remada curv.', 'Push Press', 'Terra', 'Barra fixa']]
+        
+        for item in ordered_list:
+            max_value = item['max_value']
+            ex_name = item['nome']
+            
+            if ex_name == 'Barra fixa':
+                vol_str = f"{max_value:.0f} Reps" if max_value > 0 else "N/A"
+            else:
+                if max_value >= 1000:
+                    vol_str = f"{max_value/1000:.1f}k kg"
+                elif max_value > 0:
+                    vol_str = f"{max_value:.1f} kg"
+                else:
+                    vol_str = "N/A"
+            
+            table_data.append([ex_name, vol_str, item['rank']])
+            
+        table = ax.table(cellText=table_data, 
+                         colLabels=["Exercício", "Max", "Rank"], 
+                         loc='center', 
+                         cellLoc='left',
+                         colColours=[self.colors['secondary_bg']]*3, 
+                         cellColours=[[self.colors['secondary_bg']]*3]*len(table_data)
+                         )
+                         
+        table.auto_set_font_size(False)
+        table.set_fontsize(7.5) 
+        table.scale(1, 1.25) 
+
+        for i in range(len(table_data)):
+            table[(i+1, 0)].get_text().set_color(self.colors['default']) 
+            
+            # ALTERADO PARA self.colors['radar_fill']
+            table[(i+1, 1)].get_text().set_color(self.colors['radar_fill']) 
+            
+            table[(i+1, 1)].set_text_props(ha='right') 
+            
+            # APLICAÇÃO DO GRADIENTE DE COR DO RANK:
+            rank_text = table_data[i][2] 
+            color_for_rank = self.RANK_COLORS.get(rank_text, self.colors['default']) 
+            table[(i+1, 2)].get_text().set_color(color_for_rank) 
+            table[(i+1, 2)].set_text_props(ha='center')
+            
+        for j in range(3):
+            table[(0, j)].get_text().set_color(self.colors['default'])
+        table[(0, 1)].set_text_props(ha='right')
+        table[(0, 2)].set_text_props(ha='center')
+
+    def create_volume_radar_charts(self, fig, gs_volume_charts, weekly_volume_data, weekly_data_sets):
+        """Gráfico 2: Plota o Radar, Tabela de Volume e Tabela de Força juntos."""
+        
+        total_volume_data = weekly_volume_data
+        max_volume = 10000 
+        consolidated_volumes = []
+        consolidated_volumes.append(total_volume_data.get('peitoral', 0))
+        consolidated_volumes.append(total_volume_data.get('deltoides', 0))
+        consolidated_volumes.append(total_volume_data.get('core', 0) + total_volume_data.get('adutores', 0) + total_volume_data.get('abdutores', 0)) 
+        consolidated_volumes.append(total_volume_data.get('dorsal', 0) + total_volume_data.get('romboides', 0) + total_volume_data.get('lombar', 0))
+        consolidated_volumes.append(total_volume_data.get('quadriceps', 0) + total_volume_data.get('posterior', 0) + total_volume_data.get('gluteo', 0) + total_volume_data.get('panturrilha', 0))
+        consolidated_volumes.append(total_volume_data.get('biceps', 0) + total_volume_data.get('triceps', 0) + total_volume_data.get('antebraco', 0))
+
+        if consolidated_volumes:
+            max_volume_data = max(consolidated_volumes)
+            max_volume = np.ceil(max_volume_data / 5000) * 5000
+            max_volume = max(10000, max_volume)
+
+        radar_img, radar_values_map = self._create_radar_chart(title="Volume Mensal Consolidado", 
+                                                         max_volume=max_volume, 
+                                                         volume_data=total_volume_data,
+                                                         color=self.colors['radar_fill'])
+        
+        force_rank_data = self.calculate_max_load_and_rank(weekly_data_sets)
+        
+        ax_container = fig.add_subplot(gs_volume_charts, facecolor=self.colors['secondary_bg'])
+        ax_container.set_title("2. Volume e Força (Últimas 4 Semanas)", 
+                     fontsize=12, fontweight='bold', color=self.colors['default'], pad=10)
+        ax_container.set_xticks([]); ax_container.set_yticks([]); ax_container.axis('off')
+
+        gs_inner = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=gs_volume_charts, 
+                                                    wspace=0.1, hspace=0.1,
+                                                    width_ratios=[1.2, 0.8, 1.0]) 
+        
+        # Subplot 1: Radar
+        ax_radar = fig.add_subplot(gs_inner[0, 0])
+        ax_radar.imshow(radar_img, aspect='equal')
+        ax_radar.axis('off')
+
+        # Subplot 2: Tabela de Volume
+        ax_table_volume = fig.add_subplot(gs_inner[0, 1])
+        self._plot_volume_summary_table(ax_table_volume, radar_values_map)
+
+        # Subplot 3: Tabela de Força 
+        ax_table_force = fig.add_subplot(gs_inner[0, 2])
+        self._plot_force_rank_table_internal(ax_table_force, force_rank_data) 
 
     def create_placeholder_chart_3(self, fig, ax):
-        """Gráfico 3: Placeholder para futuros dados (Ex: Progresso de Carga)."""
-        ax.set_title("3. Progresso de Carga em Exercícios Chave (Em Construção)", 
+        """Gráfico 3: Placeholder para futuros dados (Slot Livre)."""
+        ax.set_title("3. Slot em Branco (Para Próximos Gráficos)", 
                      fontsize=12, fontweight='bold', color=self.colors['default'], pad=10)
-        ax.text(0.5, 0.5, "Dados de progressão de carga em desenvolvimento.", 
+        ax.text(0.5, 0.5, "Espaço reservado para o próximo gráfico.", 
                 ha='center', va='center', color=self.colors['default'], transform=ax.transAxes)
         ax.set_xticks([]); ax.set_yticks([])
         for spine in ax.spines.values(): spine.set_visible(False)
@@ -1243,7 +1671,7 @@ class WorkoutReport:
         plt.style.use('dark_background')
         
         FIG_WIDTH, FIG_HEIGHT = 8.5, 11.0 
-        fig_page3 = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT), facecolor=self.colors['background'])
+        fig_page3 = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT), facecolor=self.colors['background'], dpi=300) 
         
         weekly_data_sets = self.fetch_data_for_four_weeks()
         
@@ -1257,11 +1685,14 @@ class WorkoutReport:
         fig_page3.suptitle("RELATÓRIO DE TREINO - PROGRESSÃO", 
                           fontsize=16, fontweight='bold', color=self.colors['default'], y=0.98)
         
+        # 1. Heatmap
         self.create_body_map_comparison(fig_page3, gs_page3[0], weekly_data_sets)
         
-        ax_placeholder_2 = fig_page3.add_subplot(gs_page3[1], facecolor=self.colors['secondary_bg'])
-        self.create_placeholder_chart_2(fig_page3, ax_placeholder_2)
+        # 2. Volume e Força
+        weekly_volume_data = self.calculate_volume_load_weekly(weekly_data_sets)
+        self.create_volume_radar_charts(fig_page3, gs_page3[1], weekly_volume_data, weekly_data_sets)
         
+        # 3. Placeholder
         ax_placeholder_3 = fig_page3.add_subplot(gs_page3[2], facecolor=self.colors['secondary_bg'])
         self.create_placeholder_chart_3(fig_page3, ax_placeholder_3)
         
